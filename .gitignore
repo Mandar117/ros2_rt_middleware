@@ -1,0 +1,17 @@
+# colcon build artifacts
+build/
+install/
+log/
+
+# generated CSV data (reproducible by running benchmark_runner)
+results/*.csv
+
+# Python cache
+__pycache__/
+*.pyc
+*.pyo
+
+# Editor artifacts
+.vscode/
+*.swp
+*~

@@ -1,0 +1,43 @@
+name: CI
+
+on:
+  push:
+    branches: ["**"]
+  pull_request:
+    branches: [main]
+
+jobs:
+  build-and-test:
+    runs-on: ubuntu-22.04
+
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          # Place the package where colcon can find it as a workspace source.
+          path: src/ros2_rt_middleware
+
+      - uses: ros-tooling/setup-ros@v0.7
+        with:
+          required-ros-distributions: humble
+
+      - name: Install rosdep dependencies
+        run: |
+          source /opt/ros/humble/setup.bash
+          rosdep install --from-paths src --ignore-src -r -y
+
+      - name: Build
+        run: |
+          source /opt/ros/humble/setup.bash
+          colcon build \
+            --packages-select ros2_rt_middleware \
+            --cmake-args -DCMAKE_BUILD_TYPE=Release -DBUILD_TESTING=ON \
+            --event-handlers console_cohesion+
+
+      - name: Test
+        run: |
+          source /opt/ros/humble/setup.bash
+          source install/setup.bash
+          colcon test \
+            --packages-select ros2_rt_middleware \
+            --event-handlers console_cohesion+
+          colcon test-result --verbose
