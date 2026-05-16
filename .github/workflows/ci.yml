@@ -23,8 +23,6 @@ jobs:
       - name: Install rosdep dependencies
         run: |
           source /opt/ros/humble/setup.bash
-          sudo rosdep init
-          rosdep update
           rosdep install --from-paths src --ignore-src -r -y
 
       - name: Build
