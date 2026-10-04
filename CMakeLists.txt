@@ -86,6 +86,11 @@ if(BUILD_TESTING)
   target_include_directories(test_executor_ordering PRIVATE ${RT_EXECUTOR_INC})
   ament_target_dependencies(test_executor_ordering rclcpp)
   target_link_libraries(test_executor_ordering rt_executor pthread)
+
+  ament_add_gtest(test_latency_end_to_end test/test_latency_end_to_end.cpp)
+  target_include_directories(test_latency_end_to_end PRIVATE ${RT_EXECUTOR_INC} ${ZC_TRANSPORT_INC})
+  ament_target_dependencies(test_latency_end_to_end rclcpp std_msgs sensor_msgs)
+  target_link_libraries(test_latency_end_to_end latency_transport rt_executor pthread rt)
 endif()
 
 ament_package()

@@ -1,6 +1,7 @@
 #pragma once
 
 #include <atomic>
+#include <cstddef>
 #include <cstdint>
 #include <memory>
 #include <string>
@@ -19,6 +20,8 @@ struct SubscriberConfig {
   std::string   topic_joint{"rt/joint_state"};
   std::string   topic_cloud{"rt/point_cloud"};
   std::string   csv_output_path{"results/latency.csv"};
+  int           cloud_width{320};   // must match PublisherConfig::cloud_width
+  int           cloud_height{1};    // must match PublisherConfig::cloud_height
 };
 
 // LatencySubscriber receives messages published by LatencyPublisher, extracts
@@ -35,6 +38,7 @@ class LatencySubscriber : public rclcpp::Node {
 public:
   explicit LatencySubscriber(const SubscriberConfig& cfg,
                               std::shared_ptr<CsvLogger> logger);
+  ~LatencySubscriber();
 
   uint64_t samples_received() const noexcept {
     return samples_.load(std::memory_order_relaxed);
@@ -57,6 +61,14 @@ private:
   rclcpp::Subscription<sensor_msgs::msg::PointCloud2>::SharedPtr    cloud_sub_;
 
   std::atomic<uint64_t> samples_{0};
+
+  // SHM transport — regions opened lazily on first callback (publisher creates
+  // them; subscriber only reads, so no shm_unlink on teardown).
+  int         shm_joint_fd_{-1};
+  void*       shm_joint_ptr_{nullptr};
+  int         shm_cloud_fd_{-1};
+  void*       shm_cloud_ptr_{nullptr};
+  std::size_t shm_cloud_size_{0};  // pre-computed from cfg_ for munmap
 };
 
 }  // namespace rt_middleware

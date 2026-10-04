@@ -6,10 +6,42 @@
 #include <cstring>
 #include <stdexcept>
 
+#include <fcntl.h>
+#include <sys/mman.h>
+#include <sys/stat.h>
+#include <unistd.h>
+
 #include <rclcpp/rclcpp.hpp>
 #include <sensor_msgs/msg/point_field.hpp>
 
 namespace rt_middleware {
+
+// ── SHM region layout ────────────────────────────────────────────────────────
+//
+// The joint-state SHM region holds one frame's worth of data plus the
+// publisher's steady_clock timestamp. The subscriber reads this struct
+// directly after receiving the lightweight notification message, avoiding
+// any deserialization of the joint payload through the ROS middleware.
+struct ShmJointRegion {
+  int64_t  publish_ns;           // steady_clock nanoseconds at publish time
+  uint32_t seq;                  // publisher sequence number
+  uint32_t _pad;                 // alignment padding
+  double   joints[kJointCount];  // joint positions (96 bytes)
+};
+static_assert(sizeof(ShmJointRegion) == 8 + 8 + kJointCount * sizeof(double),
+              "ShmJointRegion layout unexpected");
+
+// Point-cloud SHM region: fixed header followed immediately by
+// width * height * point_step bytes of raw XYZ float data.
+// shm_cloud_size_ = sizeof(ShmCloudHeader) + that data length.
+struct ShmCloudHeader {
+  int64_t  publish_ns;   // steady_clock nanoseconds at publish time
+  uint32_t seq;          // publisher sequence number
+  uint32_t width;        // cloud width in points
+  uint32_t height;       // cloud height (1 for unorganised)
+  uint32_t point_step;   // bytes per point
+};
+static_assert(sizeof(ShmCloudHeader) == 24, "ShmCloudHeader layout unexpected");
 
 // ── helpers ──────────────────────────────────────────────────────────────────
 
@@ -69,8 +101,64 @@ LatencyPublisher::LatencyPublisher(const PublisherConfig& cfg)
     ++seq_;
   });
 
+  if (cfg_.mode == PublishMode::Shm) {
+    shm_joint_fd_ = shm_open(kShmJointName, O_CREAT | O_RDWR, 0666);
+    if (shm_joint_fd_ < 0) {
+      throw std::runtime_error("LatencyPublisher: shm_open(joint) failed");
+    }
+    if (ftruncate(shm_joint_fd_, static_cast<off_t>(sizeof(ShmJointRegion))) < 0) {
+      throw std::runtime_error("LatencyPublisher: ftruncate(joint) failed");
+    }
+    shm_joint_ptr_ = mmap(nullptr, sizeof(ShmJointRegion),
+                          PROT_READ | PROT_WRITE, MAP_SHARED, shm_joint_fd_, 0);
+    if (shm_joint_ptr_ == MAP_FAILED) {
+      shm_joint_ptr_ = nullptr;
+      throw std::runtime_error("LatencyPublisher: mmap(joint) failed");
+    }
+    RCLCPP_INFO(get_logger(), "SHM joint region created: %s (%zu bytes)",
+                kShmJointName, sizeof(ShmJointRegion));
+
+    shm_cloud_size_ = sizeof(ShmCloudHeader) + cloud_msg_.data.size();
+    shm_cloud_fd_ = shm_open(kShmCloudName, O_CREAT | O_RDWR, 0666);
+    if (shm_cloud_fd_ < 0) {
+      throw std::runtime_error("LatencyPublisher: shm_open(cloud) failed");
+    }
+    if (ftruncate(shm_cloud_fd_, static_cast<off_t>(shm_cloud_size_)) < 0) {
+      throw std::runtime_error("LatencyPublisher: ftruncate(cloud) failed");
+    }
+    shm_cloud_ptr_ = mmap(nullptr, shm_cloud_size_,
+                          PROT_READ | PROT_WRITE, MAP_SHARED, shm_cloud_fd_, 0);
+    if (shm_cloud_ptr_ == MAP_FAILED) {
+      shm_cloud_ptr_ = nullptr;
+      throw std::runtime_error("LatencyPublisher: mmap(cloud) failed");
+    }
+    RCLCPP_INFO(get_logger(), "SHM cloud region created: %s (%zu bytes)",
+                kShmCloudName, shm_cloud_size_);
+  }
+
   RCLCPP_INFO(get_logger(), "LatencyPublisher ready: %u Hz, mode=%d",
               cfg_.rate_hz, static_cast<int>(cfg_.mode));
+}
+
+LatencyPublisher::~LatencyPublisher() {
+  if (shm_joint_ptr_) {
+    munmap(shm_joint_ptr_, sizeof(ShmJointRegion));
+    shm_joint_ptr_ = nullptr;
+  }
+  if (shm_joint_fd_ >= 0) {
+    close(shm_joint_fd_);
+    shm_unlink(kShmJointName);
+    shm_joint_fd_ = -1;
+  }
+  if (shm_cloud_ptr_) {
+    munmap(shm_cloud_ptr_, shm_cloud_size_);
+    shm_cloud_ptr_ = nullptr;
+  }
+  if (shm_cloud_fd_ >= 0) {
+    close(shm_cloud_fd_);
+    shm_unlink(kShmCloudName);
+    shm_cloud_fd_ = -1;
+  }
 }
 
 void LatencyPublisher::publish_joint_state() {
@@ -90,6 +178,22 @@ void LatencyPublisher::publish_joint_state() {
     auto loaned = joint_pub_->borrow_loaned_message();
     loaned.get() = joint_msg_;
     joint_pub_->publish(std::move(loaned));
+  } else if (cfg_.mode == PublishMode::Shm) {
+    // Write payload directly into the shared-memory region — no middleware
+    // serialization for the joint data itself.
+    auto* region = static_cast<ShmJointRegion*>(shm_joint_ptr_);
+    region->publish_ns = now_ns;
+    region->seq        = static_cast<uint32_t>(seq_);
+    std::memcpy(region->joints, joint_msg_.data.data(),
+                kJointCount * sizeof(double));
+
+    // Publish a minimal notification so the subscriber's callback fires.
+    // Only data[0] (the timestamp) crosses the ROS middleware; the subscriber
+    // reads the full joint payload from SHM after receiving this ping.
+    std_msgs::msg::Float64MultiArray notif;
+    notif.data.resize(1);
+    notif.data[0] = ts_as_double;
+    joint_pub_->publish(notif);
   } else {
     joint_pub_->publish(joint_msg_);
   }
@@ -101,9 +205,36 @@ void LatencyPublisher::publish_point_cloud() {
           std::chrono::steady_clock::now().time_since_epoch())
           .count();
 
-  pack_ns_into_header(cloud_msg_.header, now_ns);
-  cloud_msg_.header.frame_id = "lidar";
-  cloud_pub_->publish(cloud_msg_);
+  if (cfg_.mode == PublishMode::Shm) {
+    // Write point data directly into the SHM region.
+    auto* hdr = static_cast<ShmCloudHeader*>(shm_cloud_ptr_);
+    hdr->publish_ns = now_ns;
+    hdr->seq        = static_cast<uint32_t>(seq_);
+    hdr->width      = cloud_msg_.width;
+    hdr->height     = cloud_msg_.height;
+    hdr->point_step = cloud_msg_.point_step;
+    std::memcpy(static_cast<char*>(shm_cloud_ptr_) + sizeof(ShmCloudHeader),
+                cloud_msg_.data.data(), cloud_msg_.data.size());
+
+    // Publish a minimal notification: header + dimensions, data field empty.
+    // The subscriber reads the point payload from SHM; only the header and
+    // metadata cross the ROS middleware, keeping serialisation cost O(1).
+    sensor_msgs::msg::PointCloud2 notif;
+    pack_ns_into_header(notif.header, now_ns);
+    notif.header.frame_id = "lidar";
+    notif.width      = cloud_msg_.width;
+    notif.height     = cloud_msg_.height;
+    notif.point_step = cloud_msg_.point_step;
+    notif.row_step   = cloud_msg_.row_step;
+    notif.fields     = cloud_msg_.fields;
+    notif.is_dense   = cloud_msg_.is_dense;
+    // notif.data intentionally empty — payload lives in SHM
+    cloud_pub_->publish(notif);
+  } else {
+    pack_ns_into_header(cloud_msg_.header, now_ns);
+    cloud_msg_.header.frame_id = "lidar";
+    cloud_pub_->publish(cloud_msg_);
+  }
 }
 
 // ── LatencySubscriber ─────────────────────────────────────────────────────────
@@ -132,8 +263,31 @@ LatencySubscriber::LatencySubscriber(const SubscriberConfig& cfg,
         on_point_cloud(msg);
       });
 
+  if (cfg_.transport_mode == TransportMode::Shm) {
+    shm_cloud_size_ = sizeof(ShmCloudHeader) +
+        static_cast<std::size_t>(cfg_.cloud_width) *
+        static_cast<std::size_t>(cfg_.cloud_height) *
+        (3 * sizeof(float));
+  }
+
   RCLCPP_INFO(get_logger(), "LatencySubscriber ready, transport=%d",
               static_cast<int>(cfg_.transport_mode));
+}
+
+LatencySubscriber::~LatencySubscriber() {
+  if (shm_joint_ptr_) {
+    munmap(shm_joint_ptr_, sizeof(ShmJointRegion));
+  }
+  if (shm_joint_fd_ >= 0) {
+    close(shm_joint_fd_);
+  }
+  if (shm_cloud_ptr_) {
+    munmap(shm_cloud_ptr_, shm_cloud_size_);
+  }
+  if (shm_cloud_fd_ >= 0) {
+    close(shm_cloud_fd_);
+  }
+  // shm_unlink omitted — the publisher owns the regions.
 }
 
 void LatencySubscriber::on_joint_state(
@@ -146,14 +300,44 @@ void LatencySubscriber::on_joint_state(
 
   if (msg->data.empty()) return;
 
-  int64_t publish_ns;
-  std::memcpy(&publish_ns, &msg->data[0], sizeof(publish_ns));
+  int64_t  publish_ns;
+  uint32_t data_bytes;
+
+  if (cfg_.transport_mode == TransportMode::Shm) {
+    // Lazily map the joint SHM region on the first callback after the
+    // publisher has created it. The mapping is reused for all subsequent calls.
+    if (!shm_joint_ptr_) {
+      const int fd = shm_open("/rt_mw_joint", O_RDONLY, 0);
+      if (fd >= 0) {
+        void* ptr = mmap(nullptr, sizeof(ShmJointRegion),
+                         PROT_READ, MAP_SHARED, fd, 0);
+        if (ptr != MAP_FAILED) {
+          shm_joint_fd_  = fd;
+          shm_joint_ptr_ = ptr;
+        } else {
+          close(fd);
+        }
+      }
+    }
+    if (shm_joint_ptr_) {
+      const auto* region = static_cast<const ShmJointRegion*>(shm_joint_ptr_);
+      publish_ns = region->publish_ns;
+      data_bytes = static_cast<uint32_t>(kJointCount * sizeof(double));
+    } else {
+      // SHM not ready yet; fall back to the timestamp in the notification.
+      std::memcpy(&publish_ns, &msg->data[0], sizeof(publish_ns));
+      data_bytes = static_cast<uint32_t>(msg->data.size() * sizeof(double));
+    }
+  } else {
+    std::memcpy(&publish_ns, &msg->data[0], sizeof(publish_ns));
+    data_bytes = static_cast<uint32_t>(msg->data.size() * sizeof(double));
+  }
 
   const int64_t latency_ns = receive_ns - publish_ns;
 
   LatencyRecord rec{
       .timestamp_ns       = publish_ns,
-      .message_size_bytes = static_cast<uint32_t>(msg->data.size() * sizeof(double)),
+      .message_size_bytes = data_bytes,
       .transport_mode     = cfg_.transport_mode,
       .publish_rate_hz    = cfg_.publish_rate_hz,
       .latency_ns         = latency_ns,
@@ -170,12 +354,43 @@ void LatencySubscriber::on_point_cloud(
           std::chrono::steady_clock::now().time_since_epoch())
           .count();
 
-  const int64_t publish_ns = extract_publish_ns(msg->header);
+  int64_t  publish_ns;
+  uint32_t data_bytes;
+
+  if (cfg_.transport_mode == TransportMode::Shm) {
+    // Lazily map the cloud SHM region on the first callback.
+    if (!shm_cloud_ptr_) {
+      const int fd = shm_open("/rt_mw_cloud", O_RDONLY, 0);
+      if (fd >= 0) {
+        void* ptr = mmap(nullptr, shm_cloud_size_,
+                         PROT_READ, MAP_SHARED, fd, 0);
+        if (ptr != MAP_FAILED) {
+          shm_cloud_fd_  = fd;
+          shm_cloud_ptr_ = ptr;
+        } else {
+          close(fd);
+        }
+      }
+    }
+    if (shm_cloud_ptr_) {
+      const auto* hdr = static_cast<const ShmCloudHeader*>(shm_cloud_ptr_);
+      publish_ns = hdr->publish_ns;
+      data_bytes = hdr->width * hdr->height * hdr->point_step;
+    } else {
+      // SHM not ready yet; fall back to the timestamp in the notification header.
+      publish_ns = extract_publish_ns(msg->header);
+      data_bytes = msg->row_step * msg->height;
+    }
+  } else {
+    publish_ns = extract_publish_ns(msg->header);
+    data_bytes = msg->row_step * msg->height;
+  }
+
   const int64_t latency_ns = receive_ns - publish_ns;
 
   LatencyRecord rec{
       .timestamp_ns       = publish_ns,
-      .message_size_bytes = msg->row_step * msg->height,
+      .message_size_bytes = data_bytes,
       .transport_mode     = cfg_.transport_mode,
       .publish_rate_hz    = cfg_.publish_rate_hz,
       .latency_ns         = latency_ns,

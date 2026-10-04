@@ -1,6 +1,7 @@
 #pragma once
 
 #include <chrono>
+#include <cstddef>
 #include <cstdint>
 #include <functional>
 #include <memory>
@@ -44,12 +45,11 @@ struct PublisherConfig {
 class LatencyPublisher : public rclcpp::Node {
 public:
   explicit LatencyPublisher(const PublisherConfig& cfg);
+  ~LatencyPublisher();
 
 private:
   void publish_joint_state();
   void publish_point_cloud();
-
-  void stamp_now(std_msgs::msg::Header& hdr) const;
 
   PublisherConfig cfg_;
 
@@ -63,6 +63,16 @@ private:
   sensor_msgs::msg::PointCloud2    cloud_msg_;
 
   uint64_t seq_{0};
+
+  // SHM transport (Shm mode only) — fds, mapped pointers, and sizes.
+  static constexpr const char* kShmJointName = "/rt_mw_joint";
+  int         shm_joint_fd_{-1};
+  void*       shm_joint_ptr_{nullptr};
+
+  static constexpr const char* kShmCloudName = "/rt_mw_cloud";
+  int         shm_cloud_fd_{-1};
+  void*       shm_cloud_ptr_{nullptr};
+  std::size_t shm_cloud_size_{0};  // sizeof(ShmCloudHeader) + point data bytes
 };
 
 }  // namespace rt_middleware
