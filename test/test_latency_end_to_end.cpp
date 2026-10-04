@@ -4,30 +4,59 @@
 #include <cstddef>
 #include <filesystem>
 #include <fstream>
+#include <set>
 #include <sstream>
 #include <string>
 #include <thread>
+#include <vector>
 
-#include <fcntl.h>
-#include <sys/mman.h>
+#include <unistd.h>
 
 #include <rclcpp/rclcpp.hpp>
 
 #include "csv_logger.hpp"
 #include "latency_publisher.hpp"
 #include "latency_subscriber.hpp"
+#include "rt_executor.hpp"
 
 namespace fs = std::filesystem;
 using namespace rt_middleware;
+using namespace std::chrono_literals;
 
 // ── helpers ──────────────────────────────────────────────────────────────────
 
-// Spin pub + sub in a shared executor for `duration`, then cancel cleanly.
-static uint64_t spin_pair(
-    std::shared_ptr<LatencyPublisher>  pub,
-    std::shared_ptr<LatencySubscriber> sub,
-    std::chrono::milliseconds          duration)
-{
+struct CsvRow {
+  int64_t  timestamp_ns;
+  uint32_t size;
+  int      transport;
+  uint32_t rate;
+  int64_t  latency_ns;
+  int      type;
+  uint64_t seq;
+};
+
+static std::vector<CsvRow> read_rows(const std::string& path, std::string* header = nullptr) {
+  std::vector<CsvRow> rows;
+  std::ifstream f(path);
+  std::string line;
+  std::getline(f, line);
+  if (header) *header = line;
+  while (std::getline(f, line)) {
+    if (line.empty()) continue;
+    std::istringstream ss(line);
+    std::string c[7];
+    for (auto& field : c) std::getline(ss, field, ',');
+    rows.push_back({std::stoll(c[0]), static_cast<uint32_t>(std::stoul(c[1])),
+                    std::stoi(c[2]), static_cast<uint32_t>(std::stoul(c[3])),
+                    std::stoll(c[4]), std::stoi(c[5]), std::stoull(c[6])});
+  }
+  return rows;
+}
+
+// Spin pub + sub on one stock executor for `duration`, then cancel.
+static void spin_pair(std::shared_ptr<LatencyPublisher> pub,
+                      std::shared_ptr<LatencySubscriber> sub,
+                      std::chrono::milliseconds duration) {
   rclcpp::executors::SingleThreadedExecutor exec;
   exec.add_node(pub);
   exec.add_node(sub);
@@ -35,37 +64,6 @@ static uint64_t spin_pair(
   std::this_thread::sleep_for(duration);
   exec.cancel();
   t.join();
-  return sub->samples_received();
-}
-
-// Count data rows in a CSV (header excluded).
-static std::size_t count_csv_rows(const std::string& path)
-{
-  std::ifstream f(path);
-  if (!f.is_open()) return 0;
-  std::size_t n = 0;
-  std::string line;
-  while (std::getline(f, line)) {
-    if (!line.empty()) ++n;
-  }
-  return n > 0 ? n - 1 : 0;
-}
-
-// Return true if any latency_ns column value (last field) is positive.
-static bool any_positive_latency(const std::string& path)
-{
-  std::ifstream f(path);
-  if (!f.is_open()) return false;
-  std::string line;
-  std::getline(f, line);  // skip header
-  while (std::getline(f, line)) {
-    if (line.empty()) continue;
-    const auto pos = line.rfind(',');
-    if (pos != std::string::npos) {
-      if (std::stoll(line.substr(pos + 1)) > 0) return true;
-    }
-  }
-  return false;
 }
 
 // ── fixture ───────────────────────────────────────────────────────────────────
@@ -74,113 +72,161 @@ class LatencyEndToEnd : public ::testing::Test {
 protected:
   void SetUp() override {
     const auto* info = ::testing::UnitTest::GetInstance()->current_test_info();
-    csv_path_ = std::string("/tmp/rt_e2e_") + info->name() + ".csv";
+    const std::string id = std::string(info->name()) + "_" + std::to_string(getpid());
+    csv_path_ = (fs::temp_directory_path() / ("rt_e2e_" + id + ".csv")).string();
+    shm_name_ = "/rt_e2e_" + id;
+    // Unique topics so concurrently running tests never cross-talk.
+    topic_joint_ = "e2e/" + std::string(info->name()) + "/joint";
+    topic_cloud_ = "e2e/" + std::string(info->name()) + "/cloud";
     fs::remove(csv_path_);
   }
 
-  void TearDown() override {
-    fs::remove(csv_path_);
+  void TearDown() override { fs::remove(csv_path_); }
+
+  PublisherConfig pub_cfg(PublishMode mode, uint32_t hz) const {
+    PublisherConfig c;
+    c.mode        = mode;
+    c.rate_hz     = hz;
+    c.shm_name    = shm_name_;
+    c.topic_joint = topic_joint_;
+    c.topic_cloud = topic_cloud_;
+    return c;
+  }
+
+  SubscriberConfig sub_cfg(TransportMode mode, uint32_t hz) const {
+    SubscriberConfig c;
+    c.transport_mode  = mode;
+    c.publish_rate_hz = hz;
+    c.shm_name        = shm_name_;
+    c.topic_joint     = topic_joint_;
+    c.topic_cloud     = topic_cloud_;
+    return c;
+  }
+
+  // Runs one publisher/subscriber pair and returns the logged rows.
+  std::vector<CsvRow> run(PublishMode pm, TransportMode tm, uint32_t hz,
+                          std::chrono::milliseconds duration,
+                          uint64_t* received = nullptr, uint64_t* lost = nullptr) {
+    auto logger = std::make_shared<CsvLogger>(csv_path_);
+    auto sub    = std::make_shared<LatencySubscriber>(sub_cfg(tm, hz), logger);
+    auto pub    = std::make_shared<LatencyPublisher>(pub_cfg(pm, hz));
+    spin_pair(pub, sub, duration);
+    if (received) *received = sub->samples_received();
+    if (lost) *lost = sub->samples_lost();
+    sub.reset();
+    logger.reset();  // flush buffered records to disk before reading
+    return read_rows(csv_path_);
+  }
+
+  static void expect_sane(const std::vector<CsvRow>& rows, int transport) {
+    ASSERT_FALSE(rows.empty()) << "CSV has no data rows";
+    std::set<int> types;
+    for (const auto& r : rows) {
+      EXPECT_GT(r.latency_ns, 0);
+      EXPECT_LT(r.latency_ns, 1'000'000'000) << "latency above 1 s";
+      EXPECT_EQ(r.transport, transport);
+      types.insert(r.type);
+      if (r.type == static_cast<int>(MessageType::Joint)) {
+        EXPECT_EQ(r.size, kJointBytes);
+      } else {
+        EXPECT_EQ(r.size, kCloudBytes);
+      }
+    }
+    EXPECT_EQ(types.size(), 2u) << "expected both joint and cloud samples";
   }
 
   std::string csv_path_;
+  std::string shm_name_;
+  std::string topic_joint_;
+  std::string topic_cloud_;
 };
 
-// ── Copy transport ────────────────────────────────────────────────────────────
+// ── transports ───────────────────────────────────────────────────────────────
 
-TEST_F(LatencyEndToEnd, CopyModeReceivesSamples) {
-  PublisherConfig pub_cfg;
-  pub_cfg.mode    = PublishMode::Copy;
-  pub_cfg.rate_hz = 200;
-
-  SubscriberConfig sub_cfg;
-  sub_cfg.transport_mode  = TransportMode::Copy;
-  sub_cfg.publish_rate_hz = 200;
-
-  auto logger = std::make_shared<CsvLogger>(csv_path_);
-  auto pub    = std::make_shared<LatencyPublisher>(pub_cfg);
-  auto sub    = std::make_shared<LatencySubscriber>(sub_cfg, logger);
-
-  const uint64_t n = spin_pair(pub, sub, std::chrono::milliseconds(500));
-  EXPECT_GT(n, 0u) << "No samples received in Copy mode";
-
-  logger.reset();  // flush buffered records to disk before reading
-
-  EXPECT_GE(count_csv_rows(csv_path_), 1u) << "CSV has no data rows";
-  EXPECT_TRUE(any_positive_latency(csv_path_)) << "All latencies are non-positive";
+TEST_F(LatencyEndToEnd, CsvHeaderHasAllColumns) {
+  { CsvLogger logger(csv_path_); }
+  std::string header;
+  read_rows(csv_path_, &header);
+  EXPECT_EQ(header,
+            "timestamp_ns,message_size_bytes,transport_mode,publish_rate_hz,"
+            "latency_ns,message_type,seq");
 }
 
-// ── SHM transport — basic connectivity ───────────────────────────────────────
-
-TEST_F(LatencyEndToEnd, ShmModeReceivesSamples) {
-  // Clean up stale regions that a previously crashed run may have left behind.
-  shm_unlink("/rt_mw_joint");
-  shm_unlink("/rt_mw_cloud");
-
-  PublisherConfig pub_cfg;
-  pub_cfg.mode    = PublishMode::Shm;
-  pub_cfg.rate_hz = 200;
-
-  SubscriberConfig sub_cfg;
-  sub_cfg.transport_mode  = TransportMode::Shm;
-  sub_cfg.publish_rate_hz = 200;
-
-  auto logger = std::make_shared<CsvLogger>(csv_path_);
-  auto pub    = std::make_shared<LatencyPublisher>(pub_cfg);
-  auto sub    = std::make_shared<LatencySubscriber>(sub_cfg, logger);
-
-  const uint64_t n = spin_pair(pub, sub, std::chrono::milliseconds(500));
-  EXPECT_GT(n, 0u) << "No samples received in SHM mode";
-
-  logger.reset();
-
-  EXPECT_GE(count_csv_rows(csv_path_), 1u) << "CSV has no data rows";
-  EXPECT_TRUE(any_positive_latency(csv_path_)) << "All latencies are non-positive";
+TEST_F(LatencyEndToEnd, CopyModeReceivesBothMessageTypes) {
+  uint64_t received = 0;
+  const auto rows = run(PublishMode::Copy, TransportMode::Copy, 200, 1000ms, &received);
+  EXPECT_GT(received, 0u);
+  expect_sane(rows, static_cast<int>(TransportMode::Copy));
 }
 
-// ── SHM transport — verify payload read from SHM, not notification ────────────
-//
-// The SHM joint path logs message_size_bytes = kJointCount * sizeof(double)
-// (96 bytes). If it fell back to the 1-element notification message instead,
-// it would log 8 bytes. This test distinguishes the two paths.
+TEST_F(LatencyEndToEnd, LoanedModeReceivesSamples) {
+  // Works whether or not the RMW can loan: without loans it falls back to copy.
+  const auto rows = run(PublishMode::Loaned, TransportMode::Loaned, 200, 1000ms);
+  expect_sane(rows, static_cast<int>(TransportMode::Loaned));
+}
 
-TEST_F(LatencyEndToEnd, ShmModeJointSizeReflectsShmPayload) {
-  shm_unlink("/rt_mw_joint");
-  shm_unlink("/rt_mw_cloud");
+TEST_F(LatencyEndToEnd, ShmModeBypassesDdsAndReceivesBothTypes) {
+  uint64_t received = 0;
+  uint64_t lost = 0;
+  const auto rows = run(PublishMode::Shm, TransportMode::Shm, 200, 1000ms, &received, &lost);
+  EXPECT_GT(received, 100u);
+  EXPECT_EQ(lost, 0u) << "SHM channel lost samples at 200 Hz";
+  expect_sane(rows, static_cast<int>(TransportMode::Shm));
+}
 
-  PublisherConfig pub_cfg;
-  pub_cfg.mode    = PublishMode::Shm;
-  pub_cfg.rate_hz = 100;
-
-  SubscriberConfig sub_cfg;
-  sub_cfg.transport_mode  = TransportMode::Shm;
-  sub_cfg.publish_rate_hz = 100;
-
-  auto logger = std::make_shared<CsvLogger>(csv_path_);
-  auto pub    = std::make_shared<LatencyPublisher>(pub_cfg);
-  auto sub    = std::make_shared<LatencySubscriber>(sub_cfg, logger);
-
-  spin_pair(pub, sub, std::chrono::milliseconds(500));
-  logger.reset();
-
-  constexpr std::size_t kExpected = kJointCount * sizeof(double);  // 96
-
-  std::ifstream f(csv_path_);
-  std::string line;
-  std::getline(f, line);  // skip header
-
-  bool found = false;
-  while (std::getline(f, line)) {
-    if (line.empty()) continue;
-    std::istringstream ss(line);
-    std::string field;
-    std::getline(ss, field, ',');  // timestamp_ns
-    std::getline(ss, field, ',');  // message_size_bytes
-    if (std::stoul(field) == kExpected) { found = true; break; }
+TEST_F(LatencyEndToEnd, SequenceNumbersIncreasePerType) {
+  const auto rows = run(PublishMode::Shm, TransportMode::Shm, 200, 500ms);
+  ASSERT_FALSE(rows.empty());
+  uint64_t last[2] = {0, 0};
+  bool seen[2] = {false, false};
+  for (const auto& r : rows) {
+    if (seen[r.type]) EXPECT_GT(r.seq, last[r.type]);
+    seen[r.type] = true;
+    last[r.type] = r.seq;
   }
+}
 
-  EXPECT_TRUE(found)
-      << "Expected a joint record with message_size_bytes=" << kExpected
-      << " (full SHM payload). SHM read path may not be active.";
+// ── publisher drivers ────────────────────────────────────────────────────────
+
+TEST_F(LatencyEndToEnd, StockTimerRecordsWakeupLateness) {
+  auto logger = std::make_shared<CsvLogger>(csv_path_);
+  auto sub    = std::make_shared<LatencySubscriber>(sub_cfg(TransportMode::Shm, 200), logger);
+  auto pub    = std::make_shared<LatencyPublisher>(pub_cfg(PublishMode::Shm, 200));
+  spin_pair(pub, sub, 500ms);
+
+  const JitterStats w = pub->timer_wakeup_stats();
+  EXPECT_EQ(w.total_callbacks, pub->published());
+  EXPECT_GT(w.total_callbacks, 50u);
+  EXPECT_LE(w.p50_ns, w.p99_ns);
+}
+
+TEST_F(LatencyEndToEnd, RTExecutorDrivesExternallyTimedPublisher) {
+  auto cfg = pub_cfg(PublishMode::Shm, 200);
+  cfg.internal_timer = false;
+
+  auto logger = std::make_shared<CsvLogger>(csv_path_);
+  auto sub    = std::make_shared<LatencySubscriber>(sub_cfg(TransportMode::Shm, 200), logger);
+  auto pub    = std::make_shared<LatencyPublisher>(cfg);
+
+  RTExecutorConfig rt_cfg;
+  rt_cfg.sched_policy  = SchedPolicy::Other;
+  rt_cfg.busy_wait     = false;
+  rt_cfg.idle_sleep_ns = 1'000'000'000LL;
+  RTExecutor exec(rt_cfg);
+  exec.set_periodic_task(5ms, [&pub] { pub->publish_once(); });
+
+  std::thread t([&exec] { exec.spin(); });
+  std::this_thread::sleep_for(500ms);
+  exec.stop();
+  t.join();
+  std::this_thread::sleep_for(50ms);  // let the reader drain
+
+  const JitterStats w = exec.wakeup_stats();
+  EXPECT_EQ(w.total_callbacks, pub->published());
+  EXPECT_GE(pub->published(), 50u);
+  EXPECT_LE(pub->published(), 101u);
+  EXPECT_EQ(pub->timer_wakeup_stats().total_callbacks, 0u) << "internal timer should be off";
+  EXPECT_GT(sub->samples_received(), 0u);
 }
 
 // ── rclcpp init / shutdown ────────────────────────────────────────────────────

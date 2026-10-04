@@ -1,74 +1,83 @@
 #pragma once
 
+#include <array>
 #include <atomic>
 #include <cstddef>
 #include <cstdint>
 #include <memory>
 #include <string>
+#include <thread>
 
 #include <rclcpp/rclcpp.hpp>
-#include <std_msgs/msg/float64_multi_array.hpp>
-#include <sensor_msgs/msg/point_cloud2.hpp>
 
 #include "csv_logger.hpp"
+#include "latency_publisher.hpp"
+#include "shm_channel.hpp"
 
 namespace rt_middleware {
 
 struct SubscriberConfig {
   TransportMode transport_mode{TransportMode::Copy};
   uint32_t      publish_rate_hz{1000};
-  std::string   topic_joint{"rt/joint_state"};
-  std::string   topic_cloud{"rt/point_cloud"};
-  std::string   csv_output_path{"results/latency.csv"};
-  int           cloud_width{320};   // must match PublisherConfig::cloud_width
-  int           cloud_height{1};    // must match PublisherConfig::cloud_height
+  std::string   topic_joint{"rt/joint_sample"};
+  std::string   topic_cloud{"rt/cloud_sample"};
+  std::string   shm_name{kShmDefaultName};
+  int64_t       shm_spin_ns{0};   // SHM reader busy-poll budget before futex sleep
 };
 
-// LatencySubscriber receives messages published by LatencyPublisher, extracts
-// the embedded timestamp from the header, and logs the one-way latency.
+// LatencySubscriber receives samples from LatencyPublisher and logs one-way
+// latency for each one.
 //
 // Measurement methodology:
-//   publish_time  — steady_clock nanoseconds packed into header by publisher
-//   receive_time  — steady_clock::now() at the first line of the callback
+//   publish_time  — steady_clock nanoseconds stamped by the publisher
+//   receive_time  — steady_clock::now() as soon as the sample is in hand
+//                   (first line of the DDS callback; right after the SHM read)
 //   latency       — receive_time - publish_time
 //
-// Caveat: both nodes must share the same clock domain (i.e., run on the same
-// host). For cross-host scenarios, replace with a PTP-synced hardware clock.
+// Copy / Loaned modes use ROS subscriptions; spin this node on an executor.
+// Shm mode reads the ShmChannel on an internal thread and creates no ROS
+// subscriptions, so spinning the node is optional.
+//
+// Caveat: both ends must share the same clock domain (same host).
 class LatencySubscriber : public rclcpp::Node {
 public:
   explicit LatencySubscriber(const SubscriberConfig& cfg,
-                              std::shared_ptr<CsvLogger> logger);
-  ~LatencySubscriber();
+                             std::shared_ptr<CsvLogger> logger);
+  ~LatencySubscriber() override;
 
   uint64_t samples_received() const noexcept {
     return samples_.load(std::memory_order_relaxed);
   }
+  // Sequence-number gaps after the first sample of each type, plus SHM
+  // overruns. Includes samples the transport dropped.
+  uint64_t samples_lost() const noexcept {
+    return lost_.load(std::memory_order_relaxed);
+  }
+  // True when the RMW loans received messages (Copy/Loaned modes).
+  bool loans_available() const;
 
 private:
-  void on_joint_state(
-      const std_msgs::msg::Float64MultiArray::ConstSharedPtr& msg);
-
-  void on_point_cloud(
-      const sensor_msgs::msg::PointCloud2::ConstSharedPtr& msg);
-
-  // Extract the publisher's steady_clock nanoseconds from msg header.
-  static int64_t extract_publish_ns(const std_msgs::msg::Header& hdr);
+  void on_joint(const JointSampleMsg& msg);
+  void on_cloud(const CloudSampleMsg& msg);
+  void record(MessageType type, int64_t publish_ns, uint64_t seq,
+              uint32_t bytes, int64_t receive_ns);
+  void shm_loop();
 
   SubscriberConfig cfg_;
   std::shared_ptr<CsvLogger> logger_;
 
-  rclcpp::Subscription<std_msgs::msg::Float64MultiArray>::SharedPtr joint_sub_;
-  rclcpp::Subscription<sensor_msgs::msg::PointCloud2>::SharedPtr    cloud_sub_;
+  rclcpp::Subscription<JointSampleMsg>::SharedPtr joint_sub_;
+  rclcpp::Subscription<CloudSampleMsg>::SharedPtr cloud_sub_;
 
   std::atomic<uint64_t> samples_{0};
+  std::atomic<uint64_t> lost_{0};
 
-  // SHM transport — regions opened lazily on first callback (publisher creates
-  // them; subscriber only reads, so no shm_unlink on teardown).
-  int         shm_joint_fd_{-1};
-  void*       shm_joint_ptr_{nullptr};
-  int         shm_cloud_fd_{-1};
-  void*       shm_cloud_ptr_{nullptr};
-  std::size_t shm_cloud_size_{0};  // pre-computed from cfg_ for munmap
+  // Next expected seq per MessageType; 0 = nothing seen yet. Touched only by
+  // the single receiving thread.
+  std::array<uint64_t, 2> next_seq_{0, 0};
+
+  std::thread       shm_thread_;
+  std::atomic<bool> shm_stop_{false};
 };
 
 }  // namespace rt_middleware
