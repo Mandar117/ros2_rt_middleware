@@ -57,6 +57,19 @@ BIN="$(ros2 pkg prefix ros2_rt_middleware)/lib/ros2_rt_middleware"
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
 mkdir -p "$RESULTS_DIR"
+{
+  echo "kernel=$(uname -r)"
+  echo "kernel_version=$(uname -v)"
+  echo "machine=$(uname -m)"
+  echo "preempt_rt=$([[ "$(cat /sys/kernel/realtime 2>/dev/null)" == 1 ]] && echo yes || echo no)"
+  echo "cpus=$(nproc)"
+  echo "rmw=${RMW_IMPLEMENTATION:-rmw_fastrtps_cpp (default)}"
+  echo "rlimit_rtprio=$(ulimit -r)"
+  echo "rlimit_memlock=$(ulimit -l)"
+  echo "cpu_governor=$(cat /sys/devices/system/cpu/cpu0/cpufreq/scaling_governor 2>/dev/null)"
+  echo "isolcpus=$(grep -q isolcpus /proc/cmdline && echo yes || echo no)"
+  echo "args=--duration $DURATION --core $CPU_CORE --executors '$EXECUTORS' --modes '$MODES' --rates '$RATES' --sched $SCHED --prio $PRIO $BUSY_WAIT"
+} > "$RESULTS_DIR/env.txt"
 SUB_PID=""
 cleanup() { [[ -n "$SUB_PID" ]] && kill -INT "$SUB_PID" 2>/dev/null || true; }
 trap cleanup EXIT INT TERM

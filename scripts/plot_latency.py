@@ -156,6 +156,13 @@ def load_jitter(results_dir, warmup_s):
     return df
 
 
+def plot_scope(df):
+    """Plots show one scope: in-process if present, else cross-process."""
+    scopes = set(df["scope"])
+    return "inproc" if "inproc" in scopes or not scopes else "xproc"
+
+
+
 def pct(series, q):
     return float(np.percentile(series, q)) if len(series) else float("nan")
 
@@ -184,7 +191,7 @@ def jitter_table(jdf):
 
 def plot_cdf(df, output_dir):
     """Joint-sample latency CDF per rate: colour = transport, style = executor."""
-    joint = df[(df["message_type"] == 0) & (df["scope"] == "inproc")]
+    joint = df[(df["message_type"] == 0) & (df["scope"] == plot_scope(df))]
     for rate in sorted(joint["rate"].unique()):
         sub = joint[joint["rate"] == rate]
         fig, ax = new_figure(figsize=(8, 5))
@@ -215,7 +222,7 @@ def plot_cdf(df, output_dir):
 
 def plot_latency_vs_rate(lat, output_dir):
     """p50 and p99 (joint samples) vs rate — two panels, one shared unit."""
-    t = lat[(lat["message_type"] == 0) & (lat["scope"] == "inproc")]
+    t = lat[(lat["message_type"] == 0) & (lat["scope"] == plot_scope(lat))]
     if t.empty:
         return
     fig, axes = new_figure(1, 2, figsize=(12, 5))
@@ -243,7 +250,7 @@ def plot_latency_vs_rate(lat, output_dir):
 
 def plot_wakeup_jitter(jdf, output_dir):
     """Publisher wake-up lateness: stock vs RT, pooled over transports."""
-    j = jdf[jdf["scope"] == "inproc"]
+    j = jdf[jdf["scope"] == plot_scope(jdf)]
     if j.empty or set(j["executor"]) - {"stock", "rt"}:
         j = j[j["executor"].isin(["stock", "rt"])]
     if j.empty:
