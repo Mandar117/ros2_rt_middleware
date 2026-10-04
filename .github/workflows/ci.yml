@@ -9,6 +9,7 @@ on:
 jobs:
   build-and-test:
     runs-on: ubuntu-22.04
+    timeout-minutes: 45
 
     steps:
       - uses: actions/checkout@v4
@@ -20,17 +21,22 @@ jobs:
         with:
           required-ros-distributions: humble
 
-      - name: Install rosdep dependencies
+      - name: Install dependencies
         run: |
           source /opt/ros/humble/setup.bash
-          rosdep install --from-paths src --ignore-src -r -y
+          # setup-ros runs `rosdep init` but not `rosdep update`; without the
+          # update, `rosdep install` fails ("not been initialized yet").
+          rosdep update --rosdistro humble
+          rosdep install --from-paths src --ignore-src -r -y --rosdistro humble
+          sudo apt-get install -y python3-matplotlib python3-pandas python3-numpy
 
       - name: Build
         run: |
           source /opt/ros/humble/setup.bash
+          # Portable binaries: no -march=native on shared runners.
           colcon build \
             --packages-select ros2_rt_middleware \
-            --cmake-args -DCMAKE_BUILD_TYPE=Release -DBUILD_TESTING=ON \
+            --cmake-args -DCMAKE_BUILD_TYPE=Release -DBUILD_TESTING=ON -DRTMW_NATIVE_ARCH=OFF \
             --event-handlers console_cohesion+
 
       - name: Test
@@ -41,3 +47,24 @@ jobs:
             --packages-select ros2_rt_middleware \
             --event-handlers console_cohesion+
           colcon test-result --verbose
+
+      - name: Benchmark smoke run
+        # Exercises the full measurement pipeline (runner → CSV → plots).
+        # Shared CI runners are noisy: the numbers are not meaningful, only
+        # that the pipeline works end to end.
+        run: |
+          source /opt/ros/humble/setup.bash
+          source install/setup.bash
+          ros2 run ros2_rt_middleware benchmark_runner \
+            --duration 3 --rates 100,1000 --sched other --results-dir ci_results
+          python3 src/ros2_rt_middleware/scripts/plot_latency.py \
+            --results-dir ci_results --warmup-s 0.5
+          cat ci_results/summary.md >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Upload benchmark results
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: ci-benchmark-results
+          path: ci_results/
+          if-no-files-found: ignore

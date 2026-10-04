@@ -3,7 +3,10 @@ build/
 install/
 log/
 
-# generated CSV data (reproducible by running benchmark_runner)
+# raw benchmark samples (large; regenerate with benchmark_runner).
+# Plots, summary.md, summary.csv and env.txt are committed.
+results/**/latency_*.csv
+results/**/jitter_*.csv
 results/*.csv
 
 # Python cache
