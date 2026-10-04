@@ -24,7 +24,10 @@ jobs:
       - name: Install dependencies
         run: |
           source /opt/ros/humble/setup.bash
-          rosdep install --from-paths src --ignore-src -r -y
+          # setup-ros runs `rosdep init` but not `rosdep update`; without the
+          # update, `rosdep install` fails ("not been initialized yet").
+          rosdep update --rosdistro humble
+          rosdep install --from-paths src --ignore-src -r -y --rosdistro humble
           sudo apt-get install -y python3-matplotlib python3-pandas python3-numpy
 
       - name: Build
